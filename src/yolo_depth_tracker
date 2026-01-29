@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+
+import rospy
+import numpy as np
+import open3d as o3d
+import cv2
+import message_filters
+import tf # <--- NEW: To handle coordinate transforms
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped # <--- NEW: PoseStamped includes the Frame ID
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+from tf.transformations import quaternion_from_matrix, translation_matrix, quaternion_matrix, concatenate_matrices
+
+class AlignedDepthTracker:
+    def __init__(self):
+        rospy.init_node('yolo_aligned_tracker')
+        
+        # 1. Config & Models
+        self.bridge = CvBridge()
+        self.yolo = YOLO('src/best.pt')
+        self.voxel_size = 0.005
+        
+        # TARGET FRAME: Change this to 'world' or 'base_link' depending on your robot
+        self.target_frame = "base_link" 
+        
+        # TF Listener to find where the camera is
+        self.tf_listener = tf.TransformListener()
+
+        # Camera Intrinsics 
+        self.fx, self.fy, self.cx, self.cy = 600.0, 600.0, 320.0, 240.0
+        
+        # 2. Load CAD Model
+        try:
+            mesh = o3d.io.read_triangle_mesh("src/cup.stl") 
+            self.source_pcd = mesh.sample_points_uniformly(number_of_points=2000)
+            self.source_pcd.estimate_normals()
+            self.source_fpfh = self.get_fpfh(self.source_pcd)
+            rospy.loginfo("CAD Model Loaded Successfully.")
+        except Exception as e:
+            rospy.logerr(f"Failed to load CAD: {e}")
+            return
+
+        self.current_transform = np.identity(4)
+        self.initialized = False
+        
+        # 3. Publishers
+        # Changed to PoseStamped so we can tell ROS which frame this is in
+        self.pose_pub = rospy.Publisher('/object_pose', PoseStamped, queue_size=1)
+        self.debug_pub = rospy.Publisher('/debug/yolo_view', Image, queue_size=1)
+
+        # 4. Subscribers
+        self.info_sub = rospy.Subscriber(
+            '/sciurus17/camera/color/camera_info', 
+            CameraInfo, self.info_callback
+        )
+        
+        rgb_sub = message_filters.Subscriber('/sciurus17/camera/color/image_raw', Image)
+        depth_sub = message_filters.Subscriber('/sciurus17/camera/aligned_depth_to_color/image_raw', Image)
+        
+        self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 10, 0.1)
+        self.ts.registerCallback(self.callback)
+        
+        rospy.loginfo("Waiting for images...")
+
+    def info_callback(self, msg):
+        k = np.array(msg.K).reshape(3,3)
+        self.fx, self.fy, self.cx, self.cy = k[0,0], k[1,1], k[0,2], k[1,2]
+        self.info_sub.unregister()
+        rospy.loginfo(f"Camera Info Loaded: fx={self.fx:.1f}")
+
+    def callback(self, rgb_msg, depth_msg):
+        self.camera_frame_id = rgb_msg.header.frame_id
+
+        # 1. Convert Images
+        try:
+            cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+            cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, "16UC1")
+        except Exception as e: return
+
+        # 2. YOLO DETECTION (Every Single Frame)
+        # This acts as a "safety net" preventing the tracker from getting lost
+        results = self.yolo(cv_rgb, classes=[0], verbose=False, conf=0.4)
+        
+        if not results or not results[0].boxes:
+            # If YOLO misses the cup, we pause updates but keep the last known pose
+            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(cv_rgb, "bgr8"))
+            return
+
+        box = results[0].boxes.xyxy[0].cpu().numpy().astype(int)
+        
+        # Draw Box
+        cv2.rectangle(cv_rgb, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(cv_rgb, "bgr8"))
+
+        # 3. Extract 3D Points from YOLO Box
+        depth_roi = cv_depth[box[1]:box[3], box[0]:box[2]]
+        if depth_roi.size == 0: return
+
+        u_map, v_map = np.meshgrid(np.arange(box[0], box[2]), np.arange(box[1], box[3]))
+        z = depth_roi.astype(np.float32) / 1000.0 # mm to meters
+        
+        valid_mask = (z > 0.1) & (z < 2.0)
+        if np.count_nonzero(valid_mask) < 50: return
+        
+        x = (u_map[valid_mask] - self.cx) * z[valid_mask] / self.fx
+        y = (v_map[valid_mask] - self.cy) * z[valid_mask] / self.fy
+        z_valid = z[valid_mask]
+        
+        cup_points = np.stack((x, y, z_valid), axis=-1)
+
+        # 4. Prepare Target Cloud
+        target_pcd = o3d.geometry.PointCloud()
+        target_pcd.points = o3d.utility.Vector3dVector(cup_points)
+        target_pcd = target_pcd.voxel_down_sample(self.voxel_size)
+        target_pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30))
+
+        # 5. THE HYBRID TRACKING LOGIC
+        try:
+            # Step A: Where is the new cloud roughly?
+            # We calculate the centroid (center of mass) of the YOLO points
+            new_centroid = np.mean(cup_points, axis=0)
+
+            if not self.initialized:
+                # --- FIRST FIND (Slow RANSAC) ---
+                target_fpfh = self.get_fpfh(target_pcd)
+                result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                    self.source_pcd, target_pcd, self.source_fpfh, target_fpfh,
+                    True, 0.05,
+                    o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                    3, [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                        o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(0.05)],
+                    o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 0.999)
+                )
+                if result.fitness > 0.3:
+                    self.current_transform = result.transformation
+                    self.initialized = True
+                    rospy.loginfo(">> LOCKED ON CUP <<")
+
+            else:
+                # --- CONTINUOUS TRACKING (Fast) ---
+                
+                # CRITICAL TRICK: "Centroid Snap"
+                # If the cup moved fast, ICP will fail because the old pose is too far away.
+                # We FORCE the translation of our guess to be the new YOLO centroid.
+                # We keep the Rotation (R) from the previous frame.
+                
+                guess_transform = self.current_transform.copy()
+                guess_transform[:3, 3] = new_centroid # Snap Position
+                
+                # Run ICP from this "Snapped" position
+                result = o3d.pipelines.registration.registration_icp(
+                    self.source_pcd, target_pcd, 0.02, guess_transform,
+                    o3d.pipelines.registration.TransformationEstimationPointToPlane()
+                )
+                
+                # Update Pose
+                self.current_transform = result.transformation
+                
+                # If fit is bad (e.g. < 40%), maybe the rotation was wrong?
+                # Trigger a reset if it stays bad (optional)
+                if result.fitness < 0.4:
+                     self.initialized = False # Force RANSAC next frame if we truly lost it
+
+            # Publish Result
+            self.publish_pose(self.current_transform)
+            
+        except Exception as e:
+            rospy.logwarn(f"Registration Error: {e}")
+
+    def get_fpfh(self, pcd):
+        return o3d.pipelines.registration.compute_fpfh_feature(
+            pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 5, max_nn=100))
+
+    def publish_pose(self, camera_T_object):
+        """
+        camera_T_object: 4x4 numpy matrix (Pose of object in CAMERA frame)
+        We convert this to WORLD frame here.
+        """
+        try:
+            # 1. Get Transform from World -> Camera
+            # We look for the transform AT the time the image was taken (roughly now)
+            (trans, rot) = self.tf_listener.lookupTransform(
+                self.target_frame, self.camera_frame_id, rospy.Time(0)
+            )
+            
+            # 2. Convert ROS transform to 4x4 Matrix
+            world_T_camera = concatenate_matrices(
+                translation_matrix(trans), 
+                quaternion_matrix(rot)
+            )
+            
+            # 3. Multiply: World_T_Object = World_T_Camera * Camera_T_Object
+            world_T_object = np.dot(world_T_camera, camera_T_object)
+            
+            # 4. Publish as PoseStamped
+            p = PoseStamped()
+            p.header.stamp = rospy.Time.now()
+            p.header.frame_id = self.target_frame # Now it's in 'base_link' or 'world'
+            
+            p.pose.position.x = world_T_object[0, 3]
+            p.pose.position.y = world_T_object[1, 3]
+            p.pose.position.z = world_T_object[2, 3]
+            
+            q = quaternion_from_matrix(world_T_object)
+            p.pose.orientation.x = q[0]
+            p.pose.orientation.y = q[1]
+            p.pose.orientation.z = q[2]
+            p.pose.orientation.w = q[3]
+            
+            self.pose_pub.publish(p)
+
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            rospy.logwarn_throttle(2, f"TF Error: Could not transform camera to world: {e}")
+
+if __name__ == '__main__':
+    try:
+        AlignedDepthTracker()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

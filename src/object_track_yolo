@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+
+import rospy
+import numpy as np
+import open3d as o3d
+import cv2
+import message_filters
+import struct
+from sensor_msgs.msg import Image, PointCloud2, PointField
+from geometry_msgs.msg import Pose
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+from tf.transformations import quaternion_from_matrix
+import sensor_msgs.point_cloud2 as pc2
+
+class YoloCupTracker:
+    def __init__(self):
+        rospy.init_node('yolo_cup_pose')
+        
+        # 1. Setup Models
+        self.bridge = CvBridge()
+        rospy.loginfo("Loading YOLOv8 Segmentation (COCO)...")
+        # 'yolov8n-seg.pt' will download automatically the first time
+        self.model = YOLO('yolov8n-seg.pt') 
+        
+        # 2. Setup CAD Model (The "Source")
+        self.voxel_size = 0.005 # 5mm
+        rospy.loginfo("Loading STL Model...")
+        # REPLACE with your actual path
+        mesh = o3d.io.read_triangle_mesh("src/cup.stl") 
+        mesh.scale(0.001, center=(0,0,0)) # Convert mm to meters
+        
+        # Sample points from mesh
+        self.source_pcd = mesh.sample_points_uniformly(number_of_points=2000)
+        self.source_pcd.estimate_normals()
+        self.source_fpfh = self.get_fpfh(self.source_pcd)
+        
+        self.current_transform = np.identity(4)
+        self.initialized = False
+
+        # 3. Synchronized Subscribers (RGB + Depth)
+        # We need them to arrive together to map pixels to 3D points
+        rgb_sub = message_filters.Subscriber('/sciurus17/camera/color/image_raw', Image)
+        # Make sure this topic is the "Registered" (aligned to color) depth cloud
+        pc_sub = message_filters.Subscriber('/sciurus17/camera/depth_registered/points', PointCloud2)
+        
+        # Allow 0.1s delay between messages
+        self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, pc_sub], 10, 0.1)
+        self.ts.registerCallback(self.callback)
+        
+        self.pose_pub = rospy.Publisher('/object_pose', Pose, queue_size=1)
+        
+        rospy.loginfo("Ready. Waiting for a Cup...")
+
+    def callback(self, rgb_msg, pc_msg):
+        # --- A. YOLO DETECTION ---
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        except Exception as e: return
+
+        # Class 41 is 'cup' in COCO dataset
+        results = self.model(cv_image, classes=[41], verbose=False, conf=0.5)
+        
+        if not results or not results[0].masks:
+            return # No cup found
+
+        # Get the mask of the most confident cup
+        # Resize mask to match image dimensions exactly
+        mask = results[0].masks.data[0].cpu().numpy()
+        mask = cv2.resize(mask, (cv_image.shape[1], cv_image.shape[0]))
+        mask = (mask > 0.5) # Boolean mask
+
+        # --- B. POINT CLOUD FILTERING ---
+        # Convert ROS cloud to Numpy (H, W, 3)
+        # This helper function is defined below
+        cloud_arr = self.pc2_to_numpy(pc_msg) 
+        
+        if cloud_arr is None: return
+
+        # Apply the Mask: "Give me only the points where the pixel is white"
+        # We also remove NaNs (invalid depth points)
+        cup_points = cloud_arr[mask]
+        cup_points = cup_points[~np.isnan(cup_points).any(axis=1)]
+
+        if len(cup_points) < 100:
+            return # Cup seen, but depth data is bad/missing
+
+        # --- C. OPEN3D REGISTRATION ---
+        target_pcd = o3d.geometry.PointCloud()
+        target_pcd.points = o3d.utility.Vector3dVector(cup_points)
+        target_pcd = target_pcd.voxel_down_sample(self.voxel_size)
+        target_pcd.estimate_normals(
+             search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 3, max_nn=30))
+
+        if not self.initialized:
+            # GLOBAL SEARCH (RANSAC)
+            # Since 'cup_points' is tiny (~500 pts), this is now INSTANT
+            rospy.loginfo_once("Running Initial Search on masked cup...")
+            target_fpfh = self.get_fpfh(target_pcd)
+            
+            result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                self.source_pcd, target_pcd, self.source_fpfh, target_fpfh,
+                True, self.voxel_size * 3,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                3, [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                    o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(self.voxel_size * 3)],
+                o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 0.999)
+            )
+            
+            if result.fitness > 0.5: # 50% overlap overlap required
+                self.current_transform = result.transformation
+                self.initialized = True
+                rospy.loginfo("Cup Locked!")
+        else:
+            # FAST TRACKING (ICP)
+            result = o3d.pipelines.registration.registration_icp(
+                self.source_pcd, target_pcd, self.voxel_size * 2, 
+                self.current_transform,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            )
+            self.current_transform = result.transformation
+
+        self.publish_pose(self.current_transform)
+
+    def pc2_to_numpy(self, msg):
+        # Fast conversion of PointCloud2 to Numpy Array
+        # Assumes the cloud is 'organized' (Height > 1) which RealSense provides
+        if msg.height == 1:
+            rospy.logwarn_throttle(5, "Cloud is not organized! YOLO masking might fail.")
+            return None
+            
+        # Read raw binary data into numpy
+        # This is 100x faster than looping python generators
+        dtype_list = [('x', np.float32), ('y', np.float32), ('z', np.float32)]
+        cloud_arr = np.frombuffer(msg.data, dtype=np.dtype(dtype_list))
+        
+        # Reshape to Image dimensions
+        # We need to extract just x,y,z (removing padding if any)
+        try:
+            cloud_arr = cloud_arr.reshape((msg.height, msg.width))
+            # Convert structured array to normal float array (H, W, 3)
+            # This allows us to use the YOLO mask directly
+            return np.stack([cloud_arr['x'], cloud_arr['y'], cloud_arr['z']], axis=-1)
+        except Exception as e:
+            return None
+
+    def get_fpfh(self, pcd):
+        return o3d.pipelines.registration.compute_fpfh_feature(
+            pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 5, max_nn=100))
+
+    def publish_pose(self, matrix):
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = matrix[:3, 3]
+        q = quaternion_from_matrix(matrix)
+        p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = q
+        self.pose_pub.publish(p)
+
+if __name__ == '__main__':
+    try:
+        YoloCupTracker()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

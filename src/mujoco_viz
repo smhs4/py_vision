@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+
+import rospy
+import mujoco
+import mujoco.viewer
+import numpy as np
+import os
+# CHANGE 1: Import PoseStamped instead of Pose
+from geometry_msgs.msg import PoseStamped 
+from sensor_msgs.msg import JointState
+
+class MujocoVizNode:
+    def __init__(self):
+        rospy.init_node('mujoco_viz')
+
+        # 1. Configuration
+        self.robot_urdf_path = "src/urdf/sciurus17.xml" 
+        self.cup_mesh_path = "custom/cup.stl"
+
+        # 2. Load Robot
+        try:
+            rospy.loginfo(f"Loading robot from: {self.robot_urdf_path}")
+            self.spec = mujoco.MjSpec()
+            self.spec.from_file(self.robot_urdf_path)
+        except Exception as e:
+            rospy.logerr(f"Failed to load robot URDF: {e}")
+            return
+
+        # 3. Add Cup
+        self.add_cup_to_spec()
+
+        # 4. Compile
+        try:
+            self.model = self.spec.compile()
+            self.data = mujoco.MjData(self.model)
+        except Exception as e:
+            rospy.logerr(f"Compilation Error: {e}")
+            return
+
+        # 5. Setup ID Mappings
+        self.setup_mappings()
+
+        # 6. Subscribers
+        # CHANGE 2: Subscribe to PoseStamped
+        rospy.Subscriber('/object_pose', PoseStamped, self.pose_callback)
+        rospy.Subscriber('/joint_states', JointState, self.joint_callback)
+
+        rospy.loginfo("MuJoCo Viz Ready - Listening for PoseStamped")
+        self.run_viewer()
+
+    def add_cup_to_spec(self):
+        mesh = self.spec.add_mesh()
+        mesh.name = "cup_mesh_asset"
+        mesh.file = self.cup_mesh_path
+            
+        cup_body = self.spec.worldbody.add_body()
+        cup_body.name = "cup_body"
+        cup_body.pos = [0.5, 0.0, 0.5]
+
+        cup_geom = cup_body.add_geom()
+        cup_geom.name = "cup_geom"
+        cup_geom.type = mujoco.mjtGeom.mjGEOM_MESH
+        cup_geom.meshname = "cup_mesh_asset"
+        cup_geom.rgba = [0, 1, 0, 1]
+
+        joint = cup_body.add_joint()
+        joint.name = "cup_joint"
+        joint.type = mujoco.mjtJoint.mjJNT_FREE
+           
+    def setup_mappings(self):
+        self.joint_map = {}
+        for i in range(self.model.njnt): 
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
+            if name and name != "cup_joint":
+                self.joint_map[name] = self.model.jnt_qposadr[i]
+
+        cup_jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "cup_joint")
+        if cup_jnt_id != -1:
+            self.cup_qpos_adr = self.model.jnt_qposadr[cup_jnt_id]
+        else:
+            self.cup_qpos_adr = -1
+
+    def pose_callback(self, msg):
+        if self.cup_qpos_adr != -1:
+            start = self.cup_qpos_adr
+            
+            # CHANGE 3: Access data via 'msg.pose'
+            # (PoseStamped has header and pose, we need the pose part)
+            p = msg.pose
+            
+            self.data.qpos[start+0] = p.position.x
+            self.data.qpos[start+1] = p.position.y
+            self.data.qpos[start+2] = p.position.z
+            
+            self.data.qpos[start+3] = p.orientation.w
+            self.data.qpos[start+4] = p.orientation.x
+            self.data.qpos[start+5] = p.orientation.y
+            self.data.qpos[start+6] = p.orientation.z
+
+    def joint_callback(self, msg):
+        for name, pos in zip(msg.name, msg.position):
+            if name in self.joint_map:
+                addr = self.joint_map[name]
+                self.data.qpos[addr] = pos
+
+    def run_viewer(self):
+        with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+            while viewer.is_running() and not rospy.is_shutdown():
+                mujoco.mj_forward(self.model, self.data)
+                viewer.sync()
+                rospy.sleep(0.016)
+
+if __name__ == '__main__':
+    try:
+        MujocoVizNode()
+    except rospy.ROSInterruptException:
+        pass
