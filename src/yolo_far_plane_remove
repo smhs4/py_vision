@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+
+import rospy
+import numpy as np
+import cv2
+import struct
+import message_filters
+import open3d as o3d
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+import sensor_msgs.point_cloud2 as pc2
+
+class YoloFarPlaneRemover:
+    def __init__(self):
+        rospy.init_node('yolo_far_plane_remover')
+        
+        # 1. Config
+        self.bridge = CvBridge()
+        self.yolo = YOLO('src/best.pt') 
+        self.step = 3 # Downsampling (1 out of 3 pixels)
+        
+        # Threshold: Points within 2cm of the detected wall/table are deleted
+        self.plane_threshold = 0.003
+        
+        self.fx, self.fy, self.cx, self.cy = 600.0, 600.0, 320.0, 240.0
+        
+        self.pcl_pub = rospy.Publisher('/yolo/cleaned_cloud', PointCloud2, queue_size=1)
+        self.debug_pub = rospy.Publisher('/debug/yolo_box', Image, queue_size=1)
+
+        self.info_sub = rospy.Subscriber(
+            '/sciurus17/camera/color/camera_info', 
+            CameraInfo, self.info_callback
+        )
+        
+        rgb_sub = message_filters.Subscriber('/sciurus17/camera/color/image_raw', Image)
+        depth_sub = message_filters.Subscriber('/sciurus17/camera/aligned_depth_to_color/image_raw', Image)
+        
+        self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 10, 0.1)
+        self.ts.registerCallback(self.callback)
+        
+        rospy.loginfo("Node Ready: Removing Farthest Plane Only")
+
+    def info_callback(self, msg):
+        k = np.array(msg.K).reshape(3,3)
+        self.fx, self.fy, self.cx, self.cy = k[0,0], k[1,1], k[0,2], k[1,2]
+        self.info_sub.unregister() 
+
+    def remove_farthest_plane(self, points, colors):
+        """
+        1. Identifies the farthest 50% of points.
+        2. Fits a plane ONLY to those far points.
+        3. Removes that plane from the original cloud.
+        """
+        if len(points) < 50: return points, colors
+
+        # --- STEP 1: Find the "Background" candidates ---
+        # We assume the object is in the front, background is in the back.
+        # We take the median Z depth.
+        z_coords = points[:, 2]
+        median_z = np.median(z_coords)
+        
+        # We define "Background" as anything behind the median
+        far_indices = np.where(z_coords > median_z)[0]
+        
+        if len(far_indices) < 20: 
+            return points, colors # Not enough background points to define a plane
+
+        # --- STEP 2: Detect Plane on Background Points ONLY ---
+        # We use Open3D for robust RANSAC
+        pcd_far = o3d.geometry.PointCloud()
+        pcd_far.points = o3d.utility.Vector3dVector(points[far_indices])
+        
+        # Find the plane model [a, b, c, d] where ax + by + cz + d = 0
+        plane_model, inliers_local = pcd_far.segment_plane(distance_threshold=self.plane_threshold,
+                                                           ransac_n=3,
+                                                           num_iterations=500)
+        
+        # If no plane found, return original
+        if len(inliers_local) < 10: return points, colors
+
+        # --- STEP 3: Delete that plane from the ORIGINAL cloud ---
+        [a, b, c, d] = plane_model
+        
+        # Calculate distance of ALL points to this plane equation
+        # Distance = |ax + by + cz + d| / sqrt(a^2 + b^2 + c^2)
+        # Since Open3D returns normalized [a,b,c], the denominator is 1.0
+        distances = np.abs(np.dot(points, np.array([a, b, c])) + d)
+        
+        # Keep points that are NOT on the plane (distance > threshold)
+        # OR points that are significantly closer than the plane (foreground)
+        keep_mask = distances > self.plane_threshold
+        
+        return points[keep_mask], colors[keep_mask]
+
+    def callback(self, rgb_msg, depth_msg):
+        try:
+            cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+            cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, "16UC1")
+        except Exception: return
+
+        # 1. YOLO
+        results = self.yolo(cv_rgb, classes=[0], verbose=False, conf=0.4)
+        if not results or not results[0].boxes: return
+
+        box = results[0].boxes.xyxy[0].cpu().numpy().astype(int)
+        
+        cv2.rectangle(cv_rgb, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(cv_rgb, "bgr8"))
+
+        # 2. Extract Data
+        h, w = cv_depth.shape
+        x1, y1 = max(0, box[0]), max(0, box[1])
+        x2, y2 = min(w, box[2]), min(h, box[3])
+
+        rgb_roi = cv_rgb[y1:y2:self.step, x1:x2:self.step]
+        depth_roi = cv_depth[y1:y2:self.step, x1:x2:self.step]
+        
+        if depth_roi.size == 0: return
+
+        # 3. Project to 3D
+        h_roi, w_roi = depth_roi.shape
+        u_col = np.arange(0, w_roi) * self.step + x1
+        v_row = np.arange(0, h_roi) * self.step + y1
+        u_map, v_map = np.meshgrid(u_col, v_row)
+
+        z = depth_roi.astype(np.float32) / 1000.0 
+        valid_mask = (z > 0.1) & (z < 2.0)
+        
+        if np.count_nonzero(valid_mask) < 10: return
+
+        u_valid = u_map[valid_mask]
+        v_valid = v_map[valid_mask]
+        z_valid = z[valid_mask]
+
+        x = (u_valid - self.cx) * z_valid / self.fx
+        y = (v_valid - self.cy) * z_valid / self.fy
+        
+        points_in = np.column_stack((x, y, z_valid))
+        
+        # Flatten RGB
+        b = rgb_roi[:, :, 0][valid_mask]
+        g = rgb_roi[:, :, 1][valid_mask]
+        r = rgb_roi[:, :, 2][valid_mask]
+        colors_in = np.column_stack((r, g, b))
+
+        # ----------------------------------------------------
+        # 4. REMOVE FARTHEST PLANE
+        # ----------------------------------------------------
+        final_pts, final_cols = self.remove_farthest_plane(points_in, colors_in)
+        
+        if len(final_pts) == 0: return
+        # ----------------------------------------------------
+
+        # 5. Pack & Publish
+        r = final_cols[:, 0].astype(np.uint32)
+        g = final_cols[:, 1].astype(np.uint32)
+        b = final_cols[:, 2].astype(np.uint32)
+        
+        rgb_int = (r << 16) | (g << 8) | (b)
+        rgb_float = np.array([struct.unpack('f', struct.pack('I', i))[0] for i in rgb_int])
+        
+        points_3d = np.column_stack((final_pts[:, 0], final_pts[:, 1], final_pts[:, 2], rgb_float))
+
+        fields = [
+            PointField('x', 0, PointField.FLOAT32, 1),
+            PointField('y', 4, PointField.FLOAT32, 1),
+            PointField('z', 8, PointField.FLOAT32, 1),
+            PointField('rgb', 12, PointField.FLOAT32, 1),
+        ]
+        pc_msg = pc2.create_cloud(rgb_msg.header, fields, points_3d)
+        self.pcl_pub.publish(pc_msg)
+
+if __name__ == '__main__':
+    try:
+        YoloFarPlaneRemover()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

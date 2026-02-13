@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+
+import rospy
+import numpy as np
+import cv2
+import tf
+import message_filters
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+from scipy.spatial.transform import Rotation as R
+
+class Yolo2DPCA:
+    def __init__(self):
+        rospy.init_node('yolo_2d_pca')
+        
+        # 1. Config
+        self.bridge = CvBridge()
+        self.yolo = YOLO('src/best.pt') 
+        self.target_frame = "base_link" 
+        
+        self.tf_listener = tf.TransformListener()
+        self.fx, self.fy, self.cx, self.cy = 600.0, 600.0, 320.0, 240.0
+        
+        # 2. Publishers
+        self.pose_pub = rospy.Publisher('/object_pose', PoseStamped, queue_size=1)
+        self.debug_pub = rospy.Publisher('/debug/yolo_lines', Image, queue_size=1)
+
+        # 3. Subscribers
+        self.info_sub = rospy.Subscriber(
+            '/sciurus17/camera/color/camera_info', 
+            CameraInfo, self.info_callback
+        )
+        
+        rgb_sub = message_filters.Subscriber('/sciurus17/camera/color/image_raw', Image)
+        depth_sub = message_filters.Subscriber('/sciurus17/camera/aligned_depth_to_color/image_raw', Image)
+        
+        self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 10, 0.1)
+        self.ts.registerCallback(self.callback)
+        
+        rospy.loginfo("Node Ready: 2D Line Tracking Mode")
+
+    def info_callback(self, msg):
+        k = np.array(msg.K).reshape(3,3)
+        self.fx, self.fy, self.cx, self.cy = k[0,0], k[1,1], k[0,2], k[1,2]
+        self.info_sub.unregister() 
+
+    def get_2d_orientation(self, img_crop):
+        """
+        Calculates the angle of the dominant lines in the image crop.
+        Returns: Angle in radians (relative to vertical)
+        """
+        # 1. Convert to Grayscale
+        gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
+        
+        # 2. Edge Detection (Finds the lines/edges)
+        # You might need to tune these thresholds (50, 150)
+        # If your line is very distinct, Canny works great.
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # 3. Find Coordinates of Edge Pixels
+        # y_idxs, x_idxs = np.where(edges > 0)
+        # We stack them as (x, y) coordinates
+        points = np.column_stack(np.where(edges > 0)) # returns (y, x)
+        
+        if len(points) < 10: return 0.0, edges # No lines found
+        
+        # 4. PCA on 2D Points
+        # Swap columns to get (x, y) because numpy returns (row, col)
+        coords = points[:, ::-1] 
+        
+        # Calculate Covariance and Eigenvectors
+        mean, eigenvectors = cv2.PCACompute(coords.astype(np.float32), mean=None)
+        
+        # Principal Axis (The direction of the line)
+        v1 = eigenvectors[0] # [vx, vy]
+        
+        # Calculate Angle (arctan2 of vy/vx)
+        angle = np.arctan2(v1[1], v1[0])
+        
+        # Force "Up" direction (Cups usually point up)
+        # In image coords, -Y is Up. 
+        if v1[1] > 0: # If pointing down
+            angle += np.pi
+            
+        return angle, edges
+
+    def callback(self, rgb_msg, depth_msg):
+        try:
+            cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+            cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, "16UC1")
+        except Exception: return
+
+        # 1. YOLO
+        results = self.yolo(cv_rgb, classes=[0], verbose=False, conf=0.4)
+        if not results or not results[0].boxes: return
+        box = results[0].boxes.xyxy[0].cpu().numpy().astype(int)
+        
+        # 2. Extract Crop
+        h_img, w_img = cv_rgb.shape[:2]
+        x1, y1 = max(0, box[0]), max(0, box[1])
+        x2, y2 = min(w_img, box[2]), min(h_img, box[3])
+        
+        img_crop = cv_rgb[y1:y2, x1:x2]
+        if img_crop.size == 0: return
+
+        # ---------------------------------------------------------
+        # 3. CALCULATE 2D ORIENTATION (The new part)
+        # ---------------------------------------------------------
+        angle_rad, edge_view = self.get_2d_orientation(img_crop)
+        
+        # DEBUG: Draw the axis on the full image
+        # Center of the box
+        cx_box = (x1 + x2) // 2
+        cy_box = (y1 + y2) // 2
+        
+        # Visualize the angle
+        length = 50
+        end_x = int(cx_box + length * np.cos(angle_rad))
+        end_y = int(cy_box + length * np.sin(angle_rad))
+        cv2.arrowedLine(cv_rgb, (cx_box, cy_box), (end_x, end_y), (0, 0, 255), 3)
+        
+        # Publish Debug (Show the Canny edges + The RGB Box)
+        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(cv_rgb, "bgr8"))
+        # ---------------------------------------------------------
+
+        # 4. Calculate 3D Position (Centroid)
+        depth_roi = cv_depth[y1:y2, x1:x2]
+        z = depth_roi.astype(np.float32) / 1000.0
+        mask = (z > 0.1) & (z < 2.0)
+        
+        if np.count_nonzero(mask) < 10: return
+        
+        z_med = np.median(z[mask])
+        x_med = (cx_box - self.cx) * z_med / self.fx
+        y_med = (cy_box - self.cy) * z_med / self.fy
+
+        # 5. Construct 3D Pose
+        # Position is (x_med, y_med, z_med)
+        # Orientation is a Rotation around the Z-axis (Optical Axis) by 'angle_rad'
+        
+        # Create Rotation Matrix: Rotate around Z by the 2D angle
+        # Note: We add pi/2 because usually 0 degrees in Image is Right, but Up is -90.
+        # This part might need manual tuning (+/- 90 degrees) depending on your line.
+        r_2d = R.from_euler('z', angle_rad + np.pi/2) 
+        
+        # Pose in Camera Frame
+        camera_T_object = np.identity(4)
+        camera_T_object[:3, 3] = [x_med, y_med, z_med]
+        camera_T_object[:3, :3] = r_2d.as_matrix()
+
+        # 6. Publish
+        self.publish_ros_pose(camera_T_object, rgb_msg.header)
+
+    def publish_ros_pose(self, camera_T_object, header):
+        try:
+            (trans, rot) = self.tf_listener.lookupTransform(
+                self.target_frame, header.frame_id, rospy.Time(0)
+            )
+            
+            base_T_camera = np.dot(
+                tf.transformations.translation_matrix(trans),
+                tf.transformations.quaternion_matrix(rot)
+            )
+            
+            base_T_object = np.dot(base_T_camera, camera_T_object)
+            
+            p = PoseStamped()
+            p.header.stamp = rospy.Time.now()
+            p.header.frame_id = self.target_frame
+            
+            p.pose.position.x = base_T_object[0, 3]
+            p.pose.position.y = base_T_object[1, 3]
+            p.pose.position.z = base_T_object[2, 3]
+            
+            r = R.from_matrix(base_T_object[:3, :3].copy()) 
+            quat = r.as_quat() 
+            p.pose.orientation.x = quat[0]
+            p.pose.orientation.y = quat[1]
+            p.pose.orientation.z = quat[2]
+            p.pose.orientation.w = quat[3]
+            
+            self.pose_pub.publish(p)
+
+        except Exception: pass
+
+if __name__ == '__main__':
+    try:
+        Yolo2DPCA()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

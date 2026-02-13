@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+
+import rospy
+import numpy as np
+import struct
+import message_filters
+import cv2
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+import sensor_msgs.point_cloud2 as pc2
+
+class YoloDepthClip:
+    def __init__(self):
+        rospy.init_node('yolo_depth_clip')
+        
+        # 1. Config
+        self.bridge = CvBridge()
+        self.yolo = YOLO('src/best.pt') 
+        
+        # Less aggressive downsampling (Step 2 = 1/4th the pixels)
+        self.step = 2 
+        
+        # THE CLIPPING TIGHTNESS (in meters)
+        # We keep points that are within median_depth +/- 5cm
+        self.depth_tolerance = 0.04
+        
+        self.fx, self.fy, self.cx, self.cy = 600.0, 600.0, 320.0, 240.0
+        
+        self.pcl_pub = rospy.Publisher('/yolo/cleaned_cloud', PointCloud2, queue_size=1)
+        self.debug_pub = rospy.Publisher('/debug/yolo_box', Image, queue_size=1)
+
+        self.info_sub = rospy.Subscriber(
+            '/sciurus17/camera/color/camera_info', 
+            CameraInfo, self.info_callback
+        )
+        
+        rgb_sub = message_filters.Subscriber('/sciurus17/camera/color/image_raw', Image)
+        depth_sub = message_filters.Subscriber('/sciurus17/camera/aligned_depth_to_color/image_raw', Image)
+        
+        self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 10, 0.1)
+        self.ts.registerCallback(self.callback)
+        
+        rospy.loginfo("Node Ready: Using Median Depth Clipping")
+
+    def info_callback(self, msg):
+        k = np.array(msg.K).reshape(3,3)
+        self.fx, self.fy, self.cx, self.cy = k[0,0], k[1,1], k[0,2], k[1,2]
+        self.info_sub.unregister() 
+
+    def callback(self, rgb_msg, depth_msg):
+        try:
+            cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+            cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, "16UC1")
+        except Exception: return
+
+        # 1. YOLO Detection
+        results = self.yolo(cv_rgb, classes=[0], verbose=False, conf=0.4)
+        if not results or not results[0].boxes: return
+
+        box = results[0].boxes.xyxy[0].cpu().numpy().astype(int)
+        
+        # Debug Image
+        cv2.rectangle(cv_rgb, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(cv_rgb, "bgr8"))
+
+        # 2. Extract ROI
+        h, w = cv_depth.shape
+        x1, y1 = max(0, box[0]), max(0, box[1])
+        x2, y2 = min(w, box[2]), min(h, box[3])
+
+        rgb_roi = cv_rgb[y1:y2:self.step, x1:x2:self.step]
+        depth_roi = cv_depth[y1:y2:self.step, x1:x2:self.step]
+        
+        if depth_roi.size == 0: return
+
+        # 3. Process Depth
+        z = depth_roi.astype(np.float32) / 1000.0 
+        
+        # Initial validity check (removes 0.0 values and crazy far points)
+        basic_mask = (z > 0.1) & (z < 2.0)
+        valid_z = z[basic_mask]
+        
+        if valid_z.size < 10: return
+
+        # --- KEY STEP: MEDIAN FILTERING ---
+        # Find the "center" depth of the object
+        median_depth = np.median(valid_z)
+        
+        # Create a strict mask: Only keep points close to the median
+        # This removes the wall behind (too far) and the table in front (if angled)
+        clip_mask = (z > (median_depth - self.depth_tolerance)) & \
+                    (z < (median_depth + self.depth_tolerance))
+
+        # Combine masks
+        final_mask = basic_mask & clip_mask
+        
+        if np.count_nonzero(final_mask) < 5: return
+        # -----------------------------------
+
+        # 4. Project 3D Points
+        h_roi, w_roi = depth_roi.shape
+        u_col = np.arange(0, w_roi) * self.step + x1
+        v_row = np.arange(0, h_roi) * self.step + y1
+        u_map, v_map = np.meshgrid(u_col, v_row)
+
+        u_valid = u_map[final_mask]
+        v_valid = v_map[final_mask]
+        z_valid = z[final_mask]
+
+        x = (u_valid - self.cx) * z_valid / self.fx
+        y = (v_valid - self.cy) * z_valid / self.fy
+        
+        # 5. Pack Colors
+        b = rgb_roi[:, :, 0][final_mask]
+        g = rgb_roi[:, :, 1][final_mask]
+        r = rgb_roi[:, :, 2][final_mask]
+        
+        rgb_int = (r.astype(np.uint32) << 16) | (g.astype(np.uint32) << 8) | (b.astype(np.uint32))
+        rgb_float = np.array([struct.unpack('f', struct.pack('I', i))[0] for i in rgb_int])
+        
+        points_3d = np.column_stack((x, y, z_valid, rgb_float))
+
+        # 6. Publish
+        fields = [
+            PointField('x', 0, PointField.FLOAT32, 1),
+            PointField('y', 4, PointField.FLOAT32, 1),
+            PointField('z', 8, PointField.FLOAT32, 1),
+            PointField('rgb', 12, PointField.FLOAT32, 1),
+        ]
+        pc_msg = pc2.create_cloud(rgb_msg.header, fields, points_3d)
+        self.pcl_pub.publish(pc_msg)
+
+if __name__ == '__main__':
+    try:
+        YoloDepthClip()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

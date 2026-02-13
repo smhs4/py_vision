@@ -48,6 +48,7 @@ class AlignedDepthTracker:
         # Changed to PoseStamped so we can tell ROS which frame this is in
         self.pose_pub = rospy.Publisher('/object_pose', PoseStamped, queue_size=1)
         self.debug_pub = rospy.Publisher('/debug/yolo_view', Image, queue_size=1)
+        self.debug_depth_crop = rospy.Publisher('/debug/depth_crop', )
 
         # 4. Subscribers
         self.info_sub = rospy.Subscriber(
@@ -95,6 +96,11 @@ class AlignedDepthTracker:
 
         # 3. Extract 3D Points from YOLO Box
         depth_roi = cv_depth[box[1]:box[3], box[0]:box[2]]
+
+        cropped_image = self.bridge.cv2_to_imgmsg(depth_roi, "16UC1")
+
+
+
         if depth_roi.size == 0: return
 
         u_map, v_map = np.meshgrid(np.arange(box[0], box[2]), np.arange(box[1], box[3]))

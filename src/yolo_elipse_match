@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+
+import rospy
+import numpy as np
+import cv2
+import tf
+import message_filters
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+from scipy.spatial.transform import Rotation as R
+
+class YoloEllipsePose:
+    def __init__(self):
+        rospy.init_node('yolo_ellipse_pose')
+        
+        # 1. Config
+        self.bridge = CvBridge()
+        self.yolo = YOLO('src/best.pt') 
+        self.target_frame = "base_link" 
+        
+        # REAL WORLD CUP DIMENSIONS (You must measure your cup!)
+        # Radius of the rim in meters (e.g., 4cm radius = 0.04m)
+        self.cup_radius = 0.04 
+        
+        self.tf_listener = tf.TransformListener()
+        self.fx, self.fy, self.cx, self.cy = 600.0, 600.0, 320.0, 240.0
+        
+        # 2. Publishers
+        self.pose_pub = rospy.Publisher('/object_pose', PoseStamped, queue_size=1)
+        self.debug_pub = rospy.Publisher('/debug/ellipse_fit', Image, queue_size=1)
+
+        # 3. Subscribers
+        self.info_sub = rospy.Subscriber(
+            '/sciurus17/camera/color/camera_info', 
+            CameraInfo, self.info_callback
+        )
+        
+        # We only strictly need RGB for ellipse fitting, but depth helps verify distance
+        rgb_sub = message_filters.Subscriber('/sciurus17/camera/color/image_raw', Image)
+        depth_sub = message_filters.Subscriber('/sciurus17/camera/aligned_depth_to_color/image_raw', Image)
+        
+        self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 10, 0.1)
+        self.ts.registerCallback(self.callback)
+        
+        rospy.loginfo("Node Ready: Industrial Ellipse Tracking")
+
+    def info_callback(self, msg):
+        k = np.array(msg.K).reshape(3,3)
+        self.fx, self.fy, self.cx, self.cy = k[0,0], k[1,1], k[0,2], k[1,2]
+        self.info_sub.unregister() 
+
+    def get_pose_from_ellipse(self, ellipse, frame_shape):
+        """
+        Recover 3D Pose from 2D Ellipse parameters.
+        ellipse = ((cx, cy), (major_axis, minor_axis), angle_deg)
+        """
+        (e_cx, e_cy), (e_major, e_minor), e_angle = ellipse
+
+        # 1. Calculate Tilt (Rotation around X/Y)
+        # The ratio of minor/major axis tells us the tilt angle.
+        # If ratio is 1.0, it's a circle (facing camera directly).
+        # If ratio is 0.0, it's a line (seen from side).
+        if e_major == 0: return None
+        ratio = min(e_minor / e_major, 1.0)
+        
+        # arccos(ratio) gives the angle between the cup's normal and the camera view axis
+        tilt_angle = np.arccos(ratio)
+        
+        # 2. Calculate Distance (Z) using similar triangles
+        # Observed Size (pixels) / Focal Length (pixels) = Real Size (m) / Distance (m)
+        # Distance = (Real Diameter * Focal Length) / Observed Major Axis
+        z_est = (self.cup_radius * 2.0 * self.fx) / e_major
+        
+        # 3. Calculate X, Y Position
+        x_est = (e_cx - self.cx) * z_est / self.fx
+        y_est = (e_cy - self.cy) * z_est / self.fy
+        
+        # 4. Construct Rotation Matrix
+        # The ellipse angle tells us the rotation in the image plane (Roll)
+        # The tilt angle tells us the Pitch.
+        
+        # We start with a base rotation (Cup Top pointing to Camera)
+        # Rotate by ellipse angle (screen rotation)
+        r_screen = R.from_euler('z', -np.radians(e_angle))
+        
+        # Rotate by tilt angle (tilting away from camera)
+        # Note: This has an ambiguity (tilted forward vs backward). 
+        # Usually cups on tables are tilted "backward" relative to a high camera.
+        r_tilt = R.from_euler('x', tilt_angle) 
+        
+        # Combine
+        r_total = r_screen * r_tilt
+        
+        # Create 4x4 Matrix
+        camera_T_object = np.identity(4)
+        camera_T_object[:3, 3] = [x_est, y_est, z_est]
+        camera_T_object[:3, :3] = r_total.as_matrix()
+        
+        return camera_T_object
+
+    def callback(self, rgb_msg, depth_msg):
+        try:
+            cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        except Exception: return
+
+        # 1. YOLO
+        results = self.yolo(cv_rgb, classes=[0], verbose=False, conf=0.4)
+        if not results or not results[0].boxes: return
+        box = results[0].boxes.xyxy[0].cpu().numpy().astype(int)
+        
+        # 2. Extract ROI
+        h, w = cv_rgb.shape[:2]
+        x1, y1 = max(0, box[0]), max(0, box[1])
+        x2, y2 = min(w, box[2]), min(h, box[3])
+        roi = cv_rgb[y1:y2, x1:x2]
+        
+        if roi.size == 0: return
+
+        # 3. Detect Edges / Contours
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Blur reduces noise (texture on table)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Canny Edge Detection (Tune these thresholds!)
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Find Contours
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours: return
+        
+        # Find the largest contour (likely the rim or the cup outline)
+        largest_cnt = max(contours, key=cv2.contourArea)
+        
+        # We need at least 5 points to fit an ellipse
+        if len(largest_cnt) < 5: return
+        
+        # 4. Fit Ellipse
+        ellipse = cv2.fitEllipse(largest_cnt)
+        
+        # DRAW DEBUG (Shift ellipse back to full image coordinates)
+        (cx_local, cy_local), (major, minor), angle = ellipse
+        ellipse_global = ((cx_local + x1, cy_local + y1), (major, minor), angle)
+        
+        cv2.ellipse(cv_rgb, ellipse_global, (0, 0, 255), 2)
+        cv2.rectangle(cv_rgb, (x1, y1), (x2, y2), (0, 255, 0), 1)
+        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(cv_rgb, "bgr8"))
+
+        # 5. Recover 3D Pose
+        camera_T_object = self.get_pose_from_ellipse(ellipse_global, cv_rgb.shape)
+        
+        if camera_T_object is not None:
+            self.publish_ros_pose(camera_T_object, rgb_msg.header)
+
+    def publish_ros_pose(self, camera_T_object, header):
+        try:
+            (trans, rot) = self.tf_listener.lookupTransform(
+                self.target_frame, header.frame_id, rospy.Time(0)
+            )
+            
+            t_mat = tf.transformations.translation_matrix(trans)
+            r_mat = tf.transformations.quaternion_matrix(rot)
+            base_T_camera = np.dot(t_mat, r_mat)
+            
+            base_T_object = np.dot(base_T_camera, camera_T_object)
+            
+            p = PoseStamped()
+            p.header.stamp = rospy.Time.now()
+            p.header.frame_id = self.target_frame
+            
+            p.pose.position.x = base_T_object[0, 3]
+            p.pose.position.y = base_T_object[1, 3]
+            p.pose.position.z = base_T_object[2, 3]
+            
+            r = R.from_matrix(base_T_object[:3, :3].copy()) 
+            quat = r.as_quat() 
+            p.pose.orientation.x = quat[0]
+            p.pose.orientation.y = quat[1]
+            p.pose.orientation.z = quat[2]
+            p.pose.orientation.w = quat[3]
+            
+            self.pose_pub.publish(p)
+
+        except Exception: pass
+
+if __name__ == '__main__':
+    try:
+        YoloEllipsePose()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

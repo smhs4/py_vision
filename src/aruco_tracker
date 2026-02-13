@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+
+import rospy
+import cv2
+import numpy as np
+import tf
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped
+from cv_bridge import CvBridge, CvBridgeError
+import message_filters
+import math
+
+class MultiArucoObjectNode:
+    def __init__(self):
+        rospy.init_node('multi_aruco_node')
+
+        # --- Parameters ---
+        self.target_frame = rospy.get_param('~target_frame', 'base_link')
+        self.marker_size = rospy.get_param('~marker_size', 0.040)
+        self.bridge = CvBridge()
+        self.tf_listener = tf.TransformListener()
+
+        # --- THE MARKER MAP ---
+        # Format: { ID: [x, y, z, roll, pitch, yaw] }
+        # Where is the MARKER relative to the OBJECT CENTER?
+        self.marker_offsets = {
+            1: [0.00, 0.06, 0.0, math.pi/2 , 0, 0],       # Marker 1: 2cm above center
+               
+        }
+        
+        self.obj_T_marker_matrices = {}
+        for mid, offset in self.marker_offsets.items():
+            mat = tf.transformations.euler_matrix(offset[3], offset[4], offset[5])
+            mat[0:3, 3] = offset[0:3] 
+            # Invert because we need Marker -> Object
+            self.obj_T_marker_matrices[mid] = tf.transformations.inverse_matrix(mat)
+
+        # Detector Setup
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.parameters = cv2.aruco.DetectorParameters()
+        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.parameters)
+
+        # Pubs/Subs
+        self.image_pub = rospy.Publisher('/aruco/debug_image', Image, queue_size=1)
+        self.pose_pub = rospy.Publisher('/object_pose', PoseStamped, queue_size=1)
+        
+        img_sub = message_filters.Subscriber('/sciurus17/camera/color/image_raw', Image)
+        info_sub = message_filters.Subscriber('/sciurus17/camera/color/camera_info', CameraInfo)
+        
+        self.ts = message_filters.ApproximateTimeSynchronizer([img_sub, info_sub], 10, 0.1)
+        self.ts.registerCallback(self.main_callback)
+        rospy.loginfo("Multi-Marker Tracker Ready.")
+
+    def estimate_pose_single_markers(self, corners, mtx, dist):
+        """Helper to find Marker pose relative to Camera"""
+        marker_points = np.array([[-self.marker_size/2, self.marker_size/2, 0],
+                                  [self.marker_size/2, self.marker_size/2, 0],
+                                  [self.marker_size/2, -self.marker_size/2, 0],
+                                  [-self.marker_size/2, -self.marker_size/2, 0]], dtype=np.float32)
+        rvecs, tvecs = [], []
+        for c in corners:
+            _, rvec, tvec = cv2.solvePnP(marker_points, c, mtx, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+            rvecs.append(rvec)
+            tvecs.append(tvec)
+        return rvecs, tvecs
+
+    def main_callback(self, img_msg, info_msg):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
+            K, D = np.array(info_msg.K).reshape(3, 3), np.array(info_msg.D)
+            corners, ids, _ = self.detector.detectMarkers(frame)
+
+            if ids is not None:
+                rvecs, tvecs = self.estimate_pose_single_markers(corners, K, D)
+                all_base_T_object = []
+
+                # Get Base -> Camera transform once
+                self.tf_listener.waitForTransform(self.target_frame, img_msg.header.frame_id, img_msg.header.stamp, rospy.Duration(0.1))
+                (trans, rot) = self.tf_listener.lookupTransform(self.target_frame, img_msg.header.frame_id, img_msg.header.stamp)
+                base_T_camera = np.dot(tf.transformations.translation_matrix(trans), tf.transformations.quaternion_matrix(rot))
+
+                for i, marker_id in enumerate(ids.flatten()):
+                    if marker_id in self.obj_T_marker_matrices:
+                        # Camera -> Marker
+                        r_mat, _ = cv2.Rodrigues(rvecs[i])
+                        cam_T_marker = tf.transformations.identity_matrix()
+                        cam_T_marker[:3, :3] = r_mat
+                        cam_T_marker[:3, 3] = tvecs[i].flatten()
+
+                        # Camera -> Object center
+                        cam_T_obj = np.dot(cam_T_marker, self.obj_T_marker_matrices[marker_id])
+                        
+                        # Base -> Object center
+                        all_base_T_object.append(np.dot(base_T_camera, cam_T_obj))
+                        
+                        # VISUAL: Draw tiny axes on each detected marker
+                        cv2.drawFrameAxes(frame, K, D, rvecs[i], tvecs[i], 0.02)
+
+                if all_base_T_object:
+                    # FUSE and PUBLISH
+                    avg_trans, avg_quat = self.fuse_poses(all_base_T_object)
+                    self.publish_pose(avg_trans, avg_quat, img_msg.header.stamp)
+                    
+                    # VISUAL: Draw a LARGE axis on the image showing the FUSED Object Center
+                    # To do this, we need to convert the fused base_T_obj back to camera frame
+                    obj_in_cam = np.dot(tf.transformations.inverse_matrix(base_T_camera), 
+                                        self.make_matrix(avg_trans, avg_quat))
+                    r_vec_draw, _ = cv2.Rodrigues(obj_in_cam[:3, :3])
+                    t_vec_draw = obj_in_cam[:3, 3]
+                    cv2.drawFrameAxes(frame, K, D, r_vec_draw, t_vec_draw, 0.08)
+
+            self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
+        except Exception as e:
+            rospy.logerr(f"Node Error: {e}")
+
+    def make_matrix(self, trans, quat):
+        mat = tf.transformations.quaternion_matrix(quat)
+        mat[:3, 3] = trans
+        return mat
+
+    def fuse_poses(self, matrices):
+        avg_trans = np.mean([m[:3, 3] for m in matrices], axis=0)
+        all_quats = [tf.transformations.quaternion_from_matrix(m) for m in matrices]
+        avg_quat = np.mean(all_quats, axis=0)
+        avg_quat /= np.linalg.norm(avg_quat)
+        return avg_trans, avg_quat
+
+    def publish_pose(self, trans, quat, stamp):
+        p = PoseStamped()
+        p.header.stamp = stamp
+        p.header.frame_id = self.target_frame
+        p.pose.position.x, p.pose.position.y, p.pose.position.z = trans
+        p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w = quat
+        self.pose_pub.publish(p)
+
+if __name__ == '__main__':
+    node = MultiArucoObjectNode()
+    rospy.spin()
